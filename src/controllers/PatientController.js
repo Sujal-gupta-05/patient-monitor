@@ -1,6 +1,7 @@
 const pool = require("../config/db.js");
 
-module.exports.getAllPatients = async(req, res) => {
+
+module.exports.getAllPatients = async(req, res, next) => {
     try{
         let result;
 
@@ -13,17 +14,15 @@ module.exports.getAllPatients = async(req, res) => {
                 [req.user.s_id]
             );
         } 
-        res.status(200).json(result.rows);
+        return res.status(200).json(result.rows);
     }
     catch(err){
-        console.log(err);
-        res.status(500).json({error: "Failed to fetch patients"});
+        return next(err);
     }
-    
 }
 
-module.exports.createPatient = async(req, res) => {
-    console.log(req.body);
+
+module.exports.createPatient = async(req, res, next) => {
     
     try{
         const {name, dob, ward, bed} = req.body;
@@ -32,23 +31,21 @@ module.exports.createPatient = async(req, res) => {
             "INSERT INTO patient (name, dob, ward, bed) VALUES ($1, $2, $3, $4) RETURNING *",
             [name, dob, ward, bed]
         );
-        console.log(result);
-        res.status(201).json(result.rows[0]);
+        return res.status(201).json(result.rows[0]);
     }
     catch(err){
-        console.error(err);
-        res.status(500).json({ error: 'Failed to create patient' });
+        return next(err);
     }
     
 }
 
 
-module.exports.getPatientById = async(req, res) => {
+module.exports.getPatientById = async(req, res, next) => {
    try{
     let result;
     const {id} = req.params;
 
-    if(req.user.role == "admin"){
+    if(req.user.role === "admin"){
         result = await pool.query("SELECT * FROM patient where p_id = $1",
             [id]
         );
@@ -77,13 +74,12 @@ module.exports.getPatientById = async(req, res) => {
         return res.status(403).json({ error: 'You are not assigned to this patient' });
    }
     catch(err){
-        console.log(err);
-        res.status(500).json({ error: 'Failed to fetch patient' });
+        return next(err);
     }
 }
 
 
-module.exports.updatePatient = async(req, res) => {
+module.exports.updatePatient = async(req, res, next) => {
     try{
         const {id} = req.params;
         const {name, dob, ward, bed, status} = req.body;
@@ -99,7 +95,7 @@ module.exports.updatePatient = async(req, res) => {
         return res.status(200).json(result.rows[0]);
     }
     catch(err){
-        console.log(err);
-        res.status(500).json({error : "failed to update patient"});
+        return next(err);
     }
 }
+

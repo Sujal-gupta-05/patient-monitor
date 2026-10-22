@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict l9sSDrNhM2xZvI4nNqeBJoAcKGc0ASoBwODOusRqQp8aJhp1xcdutlNl9ES2eeX
+\restrict oqSuFccO7pXdjFkxtWdmPbuqXkuQDh5fKZV8Pay8y1KiJ0Es1SVcpg7mdMMkdaf
 
 -- Dumped from database version 18.3
 -- Dumped by pg_dump version 18.3
@@ -26,7 +26,18 @@ SET row_security = off;
 CREATE TYPE public.alert_status AS ENUM (
     'pending',
     'acknowledged',
-    'resolved'
+    'resolved',
+    'retracted'
+);
+
+
+--
+-- Name: outbox_status; Type: TYPE; Schema: public; Owner: -
+--
+
+CREATE TYPE public.outbox_status AS ENUM (
+    'pending',
+    'published'
 );
 
 
@@ -92,7 +103,10 @@ CREATE TABLE public.alert (
     acknowledged_by integer,
     acknowledged_at timestamp without time zone,
     resolved_at timestamp without time zone,
-    created_at timestamp without time zone DEFAULT now() NOT NULL
+    created_at timestamp without time zone DEFAULT now() NOT NULL,
+    retracted_by integer,
+    retracted_at timestamp with time zone,
+    retraction_reason text
 );
 
 
@@ -114,6 +128,42 @@ CREATE SEQUENCE public.alert_a_id_seq
 --
 
 ALTER SEQUENCE public.alert_a_id_seq OWNED BY public.alert.a_id;
+
+
+--
+-- Name: outbox; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.outbox (
+    event_id integer NOT NULL,
+    a_id integer NOT NULL,
+    payload jsonb NOT NULL,
+    status public.outbox_status DEFAULT 'pending'::public.outbox_status NOT NULL,
+    retry_count integer DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    published_at timestamp with time zone,
+    CONSTRAINT outbox_retry_count_check CHECK ((retry_count >= 0))
+);
+
+
+--
+-- Name: outbox_event_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.outbox_event_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: outbox_event_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.outbox_event_id_seq OWNED BY public.outbox.event_id;
 
 
 --
@@ -148,6 +198,28 @@ CREATE SEQUENCE public.patient_p_id_seq
 --
 
 ALTER SEQUENCE public.patient_p_id_seq OWNED BY public.patient.p_id;
+
+
+--
+-- Name: risk_rule; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.risk_rule (
+    vital_type public.vital_type_enum NOT NULL,
+    low_min numeric(6,2) NOT NULL,
+    low_max numeric(6,2) NOT NULL,
+    medium_min numeric(6,2) NOT NULL,
+    medium_max numeric(6,2) NOT NULL,
+    high_min numeric(6,2) NOT NULL,
+    high_max numeric(6,2) NOT NULL,
+    updated_by integer,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT risk_rule_high_contains_medium CHECK (((high_min < medium_min) AND (high_max >= medium_max))),
+    CONSTRAINT risk_rule_high_valid CHECK ((high_min < high_max)),
+    CONSTRAINT risk_rule_low_valid CHECK ((low_min < low_max)),
+    CONSTRAINT risk_rule_medium_contains_low CHECK (((medium_min < low_min) AND (medium_max >= low_max))),
+    CONSTRAINT risk_rule_medium_valid CHECK ((medium_min < medium_max))
+);
 
 
 --
@@ -227,7 +299,7 @@ CREATE TABLE public.vital_reading (
     vital_type public.vital_type_enum NOT NULL,
     value numeric(5,2) NOT NULL,
     is_flagged boolean DEFAULT false NOT NULL,
-    recorded_at timestamp without time zone DEFAULT now() NOT NULL
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -256,6 +328,13 @@ ALTER SEQUENCE public.vital_reading_r_id_seq OWNED BY public.vital_reading.r_id;
 --
 
 ALTER TABLE ONLY public.alert ALTER COLUMN a_id SET DEFAULT nextval('public.alert_a_id_seq'::regclass);
+
+
+--
+-- Name: outbox event_id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.outbox ALTER COLUMN event_id SET DEFAULT nextval('public.outbox_event_id_seq'::regclass);
 
 
 --
@@ -295,11 +374,27 @@ ALTER TABLE ONLY public.alert
 
 
 --
+-- Name: outbox outbox_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.outbox
+    ADD CONSTRAINT outbox_pkey PRIMARY KEY (event_id);
+
+
+--
 -- Name: patient patient_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.patient
     ADD CONSTRAINT patient_pkey PRIMARY KEY (p_id);
+
+
+--
+-- Name: risk_rule risk_rule_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.risk_rule
+    ADD CONSTRAINT risk_rule_pkey PRIMARY KEY (vital_type);
 
 
 --
@@ -359,6 +454,30 @@ ALTER TABLE ONLY public.alert
 
 
 --
+-- Name: alert alert_retracted_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.alert
+    ADD CONSTRAINT alert_retracted_by_fkey FOREIGN KEY (retracted_by) REFERENCES public.staff(s_id);
+
+
+--
+-- Name: outbox outbox_a_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.outbox
+    ADD CONSTRAINT outbox_a_id_fkey FOREIGN KEY (a_id) REFERENCES public.alert(a_id);
+
+
+--
+-- Name: risk_rule risk_rule_updated_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.risk_rule
+    ADD CONSTRAINT risk_rule_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.staff(s_id) ON DELETE SET NULL;
+
+
+--
 -- Name: staff_patient_assignment staff_patient_assignment_p_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -386,5 +505,5 @@ ALTER TABLE ONLY public.vital_reading
 -- PostgreSQL database dump complete
 --
 
-\unrestrict l9sSDrNhM2xZvI4nNqeBJoAcKGc0ASoBwODOusRqQp8aJhp1xcdutlNl9ES2eeX
+\unrestrict oqSuFccO7pXdjFkxtWdmPbuqXkuQDh5fKZV8Pay8y1KiJ0Es1SVcpg7mdMMkdaf
 

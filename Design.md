@@ -1,170 +1,363 @@
-## StaffPatientAssignment: own PK + assigned_at/unassigned_at instead of composite key
+# Patient Monitor --- Design Decisions and Implementation Notes
 
-Initially considered (s_id, p_id) as a composite primary key. Realized this
-breaks when a staff member is reassigned to a patient, then later reassigned
-back — the same pair would need to be inserted twice, causing either a
-duplicate-key error or forcing deletion of the original row and losing
-assignment history.
+## 1. StaffPatientAssignment: surrogate primary key and assignment history
 
-Fix: gave the table its own auto-increment id, with assigned_at and a
-nullable unassigned_at. "Currently assigned" = unassigned_at IS NULL.
-Preserves full assignment history instead of destroying it on reassignment
+Initially considered `(s_id, p_id)` as a composite primary key. This
+breaks when a staff member is unassigned from a patient and later
+reassigned: the same pair would need to be inserted again, causing a
+duplicate-key error or requiring deletion of the original row and loss
+of history.
 
-## Alert.p_id: denormalized instead of joining through VitalReading
+**Decision:** give the table its own auto-increment `id`, with
+`assigned_at` and nullable `unassigned_at`. A current assignment is
+represented by `unassigned_at IS NULL`. This preserves assignment
+history instead of destroying it on reassignment.
 
-Alert could get its patient via VitalReading.p_id (through r_id), avoiding
-duplicate data. Chose to store p_id directly on Alert instead, because the
-most frequent query in the system — "show pending alerts for my patients" —
-runs on every dashboard load and would otherwise require a join through
-VitalReading every single time. Tradeoff: p_id now exists in two places,
-so if a reading's patient ever needed correcting, both would need updating
-(unlikely to happen in this domain, so accepted the redundancy for read speed).
+## 2. Alert.p_id: denormalized for dashboard queries
 
-## Ward: kept on both Staff and Patient, not shared or derived from one another
+An alert could obtain its patient through `VitalReading.p_id` via
+`r_id`, avoiding duplicate data. We chose to store `p_id` directly on
+`Alert` because a frequent query---showing open alerts for a staff
+member's assigned patients---would otherwise require a join through
+`VitalReading`.
 
-Considered deriving a staff member's ward from whichever patients they're
-assigned to. Rejected: a staff member has a ward independent of current
-assignments (they could have zero patients and still belong to a ward;
-or be temporarily covering a different ward than their patients suggest).
-Kept both as separate current-state fields, no shared source of truth,
-since they answer different questions (where staff works vs. where
-patient is).
+**Trade-off:** `p_id` exists in two places. If a reading's patient ever
+needed correction, both records would need to be updated. This
+redundancy is accepted for simpler alert retrieval.
 
-## 4. VitalReading: one row per single measurement, not one row per multi-vital reading event
+## 3. Ward: separate fields on Staff and Patient
 
-Considered a wide table with a column per vital type (heart_rate, bp,
-spo2, temperature all on one row). Rejected: a real measurement event
-often only captures one or two vital types at a time (e.g., just heart
-rate), which would leave most columns null on most rows, and makes the
-core alerting logic ("did this specific reading cross a threshold")
-awkward to check across many columns.
+A staff member's ward is independent of current patient assignments: a
+staff member can have no patients and still belong to a ward, or
+temporarily cover another ward. Therefore, `ward` is stored
+independently on `Staff` and `Patient`; neither is derived from the
+other.
 
-Instead, each row represents exactly one measurement: p_id, vital_type
-(ENUM), value, is_flagged, recorded_at. `recorded_at` specifically
-exists because the alert-dedup logic needs to know whether multiple
-flagged readings for the same patient happened within the same short
-window (same ongoing episode → one alert) versus on separate occasions
-(separate legitimate alerts) — a question that's impossible to answer
-without a timestamp on each reading.
+## 4. VitalReading: one row per measurement
 
-## 5. Every table gets its own surrogate primary key (a_id, r_id, s_id, p_id, id)
+A wide table with a column per vital type would leave many null columns
+when a measurement event captures only one or two vital types and would
+make threshold checks awkward.
 
-Considered, at various points, using an existing foreign key column as
-a table's primary key instead of adding a new one (e.g., could Alert
-use r_id as its PK, assuming one reading maps to at most one alert?).
-Rejected this pattern everywhere it came up: tying a table's identity
-to another table's key creates a hard 1:1 coupling that may not hold as
-logic evolves (e.g., dedup rules might mean a reading generates zero
-alerts, or future logic could bundle multiple readings into one alert).
+**Decision:** each `vital_reading` row represents one measurement:
+`p_id`, `vital_type`, `value`, `is_flagged`, and `recorded_at`. The
+timestamp supports history ordering and cursor pagination, and helps
+distinguish readings recorded at different times.
 
-Every table — staff, patient, staff_patient_assignment, vital_reading,
-alert — has its own independent auto-increment surrogate key, prefixed
-with the table's initial (s_id, p_id, r_id, a_id) for clarity when
+## 5. Independent surrogate primary keys
 
-## 6. Foreign key delete behavior: RESTRICT (Postgres default), not CASCADE
+Each table---`staff`, `patient`, `staff_patient_assignment`,
+`vital_reading`, and `alert`---has its own auto-increment primary key
+(`s_id`, `p_id`, `id`, `r_id`, and `a_id` respectively). Using another
+table's foreign key as a primary key would couple identities too
+tightly: a reading may produce no alert, and alert-deduplication rules
+may evolve.
 
-I considered three options for what should happen if a patient row is
-ever deleted while vital_reading or alert rows still reference them:
-CASCADE (auto-delete the dependent rows too), SET NULL (delete the
-patient, orphan the readings/alerts), or RESTRICT (block the deletion
-entirely while dependent rows exist).
+## 6. Foreign-key delete behavior: preserve history
 
-I chose RESTRICT. My application will never intentionally run DELETE
-FROM patient — a discharge is a status update (admitted -> discharged),
-not a row deletion, consistent with how I already handled staff-patient
-assignment history (mark inactive, don't delete). RESTRICT enforces
-this same "never destroy historical data" principle at the database
-level itself, not just in my application code — so even a bug, a bad
-script, or a careless manual query can't accidentally wipe out a
-patient's vitals and alert history. Since RESTRICT is Postgres's
-default behavior for foreign keys with no ON DELETE clause specified,
-no extra syntax was needed on any of the existing REFERENCES — this
-was a deliberate choice to keep the default, not an oversight.
+Foreign keys use PostgreSQL's default restrictive behavior rather than
+`ON DELETE CASCADE`. A patient discharge is represented by a status
+update (`admitted` to `discharged`), not by deleting the patient and its
+clinical history. This protects historical readings and alerts from
+accidental deletion.
+
+The benchmark seed script has a deliberate reset mode for local test
+data only; it is not application deletion behavior and must not be used
+against a database whose data needs preserving.
+
+## 7. Role-based access control
+
+The `staff_role` enum includes `nurse`, `doctor`, and `admin`. - Admins
+handle administrative actions such as patient creation/updates and
+staff-patient assignment. - Nurses and doctors handle clinical actions
+such as submitting vital readings and managing alerts. - Authentication
+alone is not sufficient; routes enforce the role permitted for each
+action.
+
+Alert routes are restricted to authenticated nurses and doctors. Patient
+assignment checks ensure staff can access only patients currently
+assigned to them where required.
+
+## 8. Frontend: minimal React application
+
+The frontend uses React/Vite on `localhost:5173`, while the Express API
+runs separately on `localhost:8080`. CORS is configured to allow the
+local frontend origin with credentials for session-based authentication.
+The frontend is deliberately minimal: the backend and system-design work
+are the project's primary focus.
+
+The longer-term frontend plan includes a live alert feed; WebSocket
+delivery is a later roadmap phase, not yet implemented.
+
+## 9. Patient access: 403 versus 404
+
+For an authenticated nurse or doctor requesting a patient they are not
+assigned to, the API returns `403 Forbidden`; if the patient does not
+exist, it returns `404 Not Found`. This is an explicit project decision
+based on the current authenticated-staff threat model. A stricter
+production environment may choose to avoid revealing whether an
+inaccessible patient exists.
+
+## 10. Patient lookup query ordering
+
+For assignment-scoped patient lookup, the common successful path should
+avoid unnecessary queries. The assignment-filtered lookup is attempted
+first; if it returns no row, a second existence check distinguishes a
+missing patient (`404`) from an existing but unassigned patient (`403`).
+This makes the less common failure path slightly more expensive in
+exchange for a cheaper successful path.
+
+## 11. Alert deduplication and severity escalation
+
+Repeated abnormal readings should not flood the dashboard, but a
+worsening condition must still be surfaced. The severity order is
+`low < medium < high`.
+
+When a reading is evaluated, compare its severity with existing open
+alerts for the same patient and vital type. Create a new alert only when
+the new severity is higher than the highest relevant open severity.
+Repeated readings at the same or lower severity do not create another
+alert. The open statuses are `pending` and `acknowledged`; `resolved`
+and `retracted` alerts do not suppress new alerts.
+
+The comparison is performed in the vital-submission transaction. The
+patient row is selected `FOR UPDATE` before the batch is inserted and
+evaluated, serializing submissions for the same patient so concurrent
+requests do not race through the alert-deduplication decision. Readings
+and resulting alerts are committed atomically.
+
+## 12. Batch vital submission: transaction and row locking
+
+`POST /patients/:id/vitals` accepts a batch of readings. It checks the
+staff member's active assignment, locks the patient row with
+`SELECT ... FOR UPDATE`, inserts the batch, evaluates each reading,
+flags abnormal readings, and creates only warranted severity-escalation
+alerts.
+
+These operations run in a PostgreSQL transaction. If a step fails, the
+transaction is rolled back; if all steps succeed, readings and alerts
+are committed together. This prevents a reading from being persisted
+without its corresponding alert decision, or vice versa.
+
+## 13. Alert lifecycle: pending, acknowledged, resolved, and retracted
+
+Alert acknowledgement and resolution are separate workflow steps.
+Acknowledging an alert records who acknowledged it and when. Resolution
+records the resolution time. An alert can be resolved while pending or
+acknowledged, according to the current controller behavior.
+
+**Retraction is distinct from resolution.** Retraction is for an alert
+created incorrectly or otherwise deemed invalid---not simply because a
+later reading is normal. It preserves the alert row and records
+`retracted_by`, `retracted_at`, and a required `retraction_reason`.
+Retraction requires a non-empty reason (trimmed and validated, maximum
+500 characters) and is limited to staff currently assigned to the
+patient.
+
+The `alert_status` enum includes `pending`, `acknowledged`, `resolved`,
+and `retracted`. Normal alert-list retrieval shows pending and
+acknowledged alerts; a direct lookup can still expose a retracted alert
+for audit purposes. Retracted alerts are excluded from the open-alert
+deduplication query.
+
+## 14. Assignment-scoped authorization for clinical endpoints
+
+The vital-history endpoint and alert actions enforce current assignment
+scope. Nurses and doctors can retrieve a patient's vital history only
+when they have an active assignment (`unassigned_at IS NULL`). Admin
+access to this clinical history endpoint is intentionally not enabled.
+Alert acknowledge, resolve, and retract operations also check active
+assignment in the database update/query, rather than relying only on
+frontend behavior.
+
+For history access, a missing patient returns `404`; an existing patient
+who is not assigned to the requester returns `403`.
+
+## 15. Vital-history pagination: keyset cursor instead of offset pagination
+
+`GET /patients/:id/vitals` uses keyset/cursor pagination. The default
+page size is 20, the maximum is 100, and the query fetches `limit + 1`
+rows to determine whether another page exists.
+
+Results are ordered by `recorded_at DESC, r_id DESC`. The next cursor
+carries both `recordedAt` and `rId`, and the next page applies
+`(recorded_at, r_id) < ($timestamp, $id)`. Including `r_id` as a
+tie-breaker makes the ordering deterministic when timestamps match and
+avoids common duplicate/skip problems of offset pagination when new rows
+are inserted.
+
+The endpoint returns `readings`, `hasMore`, and `nextCursor`. Invalid
+JSON cursors return `400`. The `recorded_at` column was changed in the
+live database from `timestamp without time zone` to
+`timestamp with time zone` using an explicit `Asia/Kolkata`
+interpretation of existing timestamps. The schema dump was refreshed
+afterward so `schema.sql` reflects the current live structure.
+
+## 16. Database indexes: primary-key indexes versus foreign-key indexes
+
+PostgreSQL automatically creates indexes for primary keys and unique
+constraints. The inspected database has primary-key indexes on
+`alert.a_id`, `patient.p_id`, `staff.s_id`,
+`staff_patient_assignment.id`, and `vital_reading.r_id`, plus the unique
+index on `staff.email`.
+
+PostgreSQL does **not** automatically create an index on the referencing
+side of a foreign key. In particular, there is currently no index on
+`vital_reading.p_id` or the history-ordering combination. The index
+choice and before/after measurement are reserved for Phase 1; no history
+index has yet been added.
+
+## 17. Vital-history performance baseline before indexing
+
+A baseline was captured using `EXPLAIN (ANALYZE, BUFFERS)` against the
+100,000-row benchmark dataset with a query matching the history
+endpoint's ordering and `LIMIT 21`.
+
+Observed output: - Execution time: `15.527 ms` - `vital_reading`
+sequential scan examined the full table. - `1,000` rows matched the
+selected patient and `99,000` were removed by the `p_id` filter. - The
+matching rows were sorted using top-N heapsort before the first 21 were
+returned. - The plan reported `Buffers: shared hit=743` for the main
+scan/sort portion.
+
+This is a local preliminary baseline, not a production latency claim.
+The matching composite index and repeat measurement belong to Phase 1.
+Any resume claim must use measured before/after results under documented
+test conditions.
+
+## 18. Benchmark seed script: bulk generation and safe modes
+
+`scripts/seedBenchmark.js` generates synthetic benchmark patients and
+readings with PostgreSQL `generate_series()` and bulk SQL rather than
+issuing one query per reading. Default settings are 100 patients and
+1,000 readings per patient (100,000 readings total). Synthetic readings
+are test data only and are not clinically validated.
+
+The script supports: - **Default dry-run mode:** creates rows inside a
+transaction and rolls back. - `--commit`: persists generated benchmark
+data. - `--reset --commit`: deliberately truncates the application's
+five tables (`alert`, `vital_reading`, `staff_patient_assignment`,
+`patient`, `staff`), restarts identities, and inserts the benchmark
+dataset.
+
+`--reset` without `--commit` is rejected. The reset mode is destructive
+and intended only for a local development/test database; it removes
+staff accounts, assignments, patients, readings, and alerts while
+preserving table structures and schema. After reset, staff accounts and
+assignments must be recreated before authenticated route tests.
+
+Verified dry-run results: - 100 patients and 100,000 readings generated
+successfully. - Latest observed reading-insert time: `611 ms`; total
+elapsed time: `634 ms`. - A separate dry run reported `622 ms` for
+reading insertion and `630 ms` total. - After rollback, the database
+retained its original `6` patients, `12` readings, and `3` alerts.
+
+The dataset was subsequently committed and verified: - `staff`: `0` -
+`patient`: `100` - `staff_patient_assignment`: `0` - `vital_reading`:
+`100,000` - `alert`: `0`
+
+Insert timings are local measurements for this seed operation, not a
+before/after optimization claim.
+
+## 19. Centralized error handling
+
+Controllers forward unexpected errors using `next(err)`. The centralized
+error handler returns the error's `statusCode` when present and
+otherwise returns `500` with a generic `Internal Server Error` message,
+avoiding disclosure of unexpected internal error details.
+
+`AppError` provides an error class that carries a `statusCode`.
+PostgreSQL-specific error-code mapping has deliberately been deferred
+rather than added without a defined handling policy.
+
+## 20. Schema and repository hygiene
+
+`schema.sql` was refreshed from the live PostgreSQL database using
+`pg_dump --schema-only --no-owner --no-privileges`. The diff confirmed
+the live `retracted` enum value, alert retraction fields and foreign
+key, and `vital_reading.recorded_at TIMESTAMPTZ`. The refreshed
+`schema.sql` was copied into place and verified identical to the
+temporary dump.
+
+`.gitignore` ignores `node_modules/`, `.env`, session-cookie files, and
+the temporary `schema_updated.sql` export. `.env.example` was created
+with placeholder values rather than real credentials. A temporary
+`table_columns.txt` file was used during inspection and should be
+removed after use.
+
+The session configuration still has a development fallback secret. The
+production-only `SESSION_SECRET` startup guard was discussed but
+intentionally deferred until the hardening phase; do not treat it as
+implemented.
+
+## 21. Current implementation and roadmap status
+
+**Implemented and verified** - Patient/staff assignment routes and
+assignment history model. - Batch vital submission with transaction,
+patient row lock, evaluation, flagging, and severity-based alert
+creation. - Alert list/detail, acknowledge, resolve, and retract
+handlers with assignment checks. - Retraction reason validation and
+audit fields. - Vital-history cursor pagination, page-size validation,
+assignment scoping, and `TIMESTAMPTZ` ordering. - Centralized Express
+error handler and `AppError`. - Refreshed `schema.sql`, `.gitignore`
+updates, `.env.example`, and a working benchmark seed script. - A
+100,000-reading benchmark dataset and initial unindexed query
+plan/timing.
+
+**Still pending** - Finish Phase 0 checklist/documentation housekeeping
+and remove temporary files. - Phase 1: migrations, repeatable index
+creation, query-plan baselines for other hot queries, before/after index
+measurements, API load tests (including many-patient and hot-patient
+cases), and PostgreSQL pool tuning. - Recreate development staff
+accounts and patient assignments after the intentional benchmark reset
+before authenticated route tests. - Phase 2: `risk_rule` table, admin
+GET/PUT endpoints, validation (`min < max`), and refactor
+`evaluateReading` to receive configurable rules. - Later phases: Redis,
+transactional outbox and RabbitMQ dispatch, WebSockets, frontend
+integration, hardening, automated tests, Docker, CI/CD, deployment, and
+final evidence packaging.
+
+Do not claim pending items as complete. Performance and reliability
+resume bullets must be based on measured results, with dataset size,
+test conditions, and before/after metrics recorded.
 
 
-## 7. Added 'admin' as a third staff role, alongside nurse and doctor
 
-I initially modeled staff_role with only nurse and doctor, but realized
-this meant every staff member would have identical permissions — anyone
-could admit patients, assign beds, AND manage clinical vitals/alerts.
-This mirrors the exact shallow "role-based auth" gap I had in an earlier
-project, where role distinctions existed in name but not in actual
-enforced permissions.
+## 22. Transactional outbox for reliable alert dispatch
 
-I added 'admin' as a distinct role: admins handle patient admission,
-ward/bed assignment, and staff-patient assignment (administrative tasks),
-while nurse/doctor handle vital readings and alert management (clinical
-tasks). This means my authorization middleware will need to check not
-just "is this user logged in" but "is this specific role allowed to
-perform this specific action" — genuine role-based access control,
-not just a label.
+Alert creation and notification dispatch are separate responsibilities.
+The `alert` table represents the clinical alert and its lifecycle, while
+the outbox records events that still need to be published to downstream
+systems such as RabbitMQ.
 
-## 8. Frontend: React instead of server-rendered EJS, kept deliberately minimal
+**Decision:** use a separate transactional outbox table rather than
+storing message-dispatch state directly on `alert`.
 
-I initially considered EJS, since it's what I used in my earlier projects.
-Rejected it once I worked through what this project actually needs: a
-staff dashboard that receives real-time alert pushes via WebSocket,
-without page reloads. EJS only renders a full HTML page once, at request
-time — it has no mechanism to update an already-loaded page when new
-data arrives on the server side. Real-time delivery needs a persistent
-client-side app that can listen for incoming events and update the DOM
-in place, which server-rendered templating doesn't provide.
+When an alert is created, the alert row and its corresponding outbox
+event must be inserted in the same PostgreSQL transaction. This ensures
+that either both are committed or neither is committed.
 
-Chose React over plain vanilla JS for the actual build, since I already
-know React's fundamentals but haven't built anything substantial with
-it — this project is a reasonable, low-stakes place to do that for real.
-Deliberately scoped the frontend to stay minimal (a patient form, a live
-alert feed) rather than a full multi-page app, since this project's
-core value is backend/system-design depth — the frontend's job is to
-prove the backend works, not to be the differentiator.
+A background worker will read pending outbox events and publish them
+to RabbitMQ. If RabbitMQ is unavailable, events remain persisted in
+PostgreSQL and can be retried after service recovery.
 
-Running frontend (Vite, localhost:5173) and backend (Express,
-localhost:8080) as separate processes required enabling CORS on the
-backend, since browsers block cross-origin requests by default. Used
-the `cors` package with open access for local development; would
-restrict allowed origins explicitly in a production deployment.
+**Why not store dispatch status on `alert`?** Keeping dispatch state
+separate avoids coupling the clinical alert lifecycle to message
+delivery. It also supports multiple events for one alert in the future,
+such as alert creation, severity escalation, and resolution.
 
-## 9. getPatientById for non-admin roles: 403 vs 404 for an unassigned patient
+**Reliability guarantees and limitations:**
+- A committed alert cannot be created without its corresponding outbox
+  event.
+- A failed database transaction cannot leave behind a committed outbox
+  event for an alert that was rolled back.
+- RabbitMQ publishing is performed outside the PostgreSQL transaction.
+- Publishing may occur more than once if a worker crashes after
+  publishing but before recording success; retries and idempotent
+  processing must account for duplicates.
+- RabbitMQ publisher confirms, durable queues, persistent messages,
+  retry handling, and dead-letter handling will be configured as part
+  of the dispatch implementation.
 
-When a nurse or doctor requests a patient they are not currently assigned
-to, I considered returning 404 (Not Found) instead of 403 (Forbidden).
-The general security argument for 404 is real: a 403 confirms a resource
-exists even to a requester who can't access it, which can be a genuine
-information leak in systems reachable by untrusted or anonymous parties
-(e.g., ID enumeration revealing how many records exist).
-
-I chose 403 instead, after weighing the actual threat model for this
-system specifically. Every requester who could hit this endpoint at all
-is already an authenticated staff member of the same hospital, not an
-anonymous or external party — so the realistic risk is narrow (a staff
-member probing IDs outside their assignment), not the broad enumeration
-risk the 404 argument is designed to prevent. Given that, 403 is more
-conventional REST semantics and easier to reason about, and I judged
-the information-leak risk acceptable for this project's actual scope.
-I would reconsider this in favor of 404 if this system were handling
-real patient data under genuine regulatory scrutiny (HIPAA-style
-requirements do treat this distinction seriously, even among authorized
-staff) — but for this project, 403 was the deliberate, documented choice,
-not an oversight.
-
-## 10. getPatientById query ordering: JOIN-first, existence-check as fallback
-
-For a non-admin requester, distinguishing "patient doesn't exist" (404)
-from "patient exists but isn't assigned to you" (403) requires knowing
-which condition actually failed — a single JOIN query filtered by both
-s_id and p_id can't tell you that on its own, since an empty result could
-mean either.
-
-I considered running a plain existence check (SELECT p_id FROM patient
-WHERE p_id = $1) first, then the JOIN-filtered query second. Rejected
-this ordering: it means every successful request — a nurse fetching a
-patient they ARE assigned to, which is the realistic common case —
-pays for two queries instead of one.
-
-Instead, I run the JOIN-filtered query first. If it returns a row, the
-request succeeds in a single query — the common, successful path stays
-cheap. Only if it returns nothing do I run a second, simple existence
-check, purely to decide whether the correct response is 403 or 404.
-This accepts a slightly more expensive failure path in exchange for a
-cheaper success path, on the principle that the common case should be
-optimized first, not the exception.
+This decision improves recoverability of notification dispatch but
+does not guarantee exactly-once delivery.

@@ -1,6 +1,15 @@
 node_modules/
 .env
+.env.*
+!.env.example
 
-# Session cookies
-*_cookies.txt
+# Session cookies and authentication test files
 cookies.txt
+*_cookies.txt
+*-cookies.txt
+admin-cookies.txt
+nurse.txt
+test_login_cookies.txt
+
+# Temporary database schema exports
+schema_updated.sql

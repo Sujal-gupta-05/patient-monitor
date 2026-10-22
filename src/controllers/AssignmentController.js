@@ -1,6 +1,6 @@
 const pool = require('../config/db.js');
 
-module.exports.assignStaffToPatient = async(req, res) => {
+module.exports.assignStaffToPatient = async(req, res, next) => {
     try{
         const {id} = req.params;
         const {s_id} = req.body;
@@ -10,7 +10,7 @@ module.exports.assignStaffToPatient = async(req, res) => {
             return res.status(404).json({ error: 'Patient not found' });
         }
 
-        const staffCheck = await pool.query("SELECT s_id FROM staff WHERE s_id = $1", [s_id]);
+        const staffCheck = await pool.query("SELECT s_id, role FROM staff WHERE s_id = $1", [s_id]);
         if (staffCheck.rows.length === 0) {
             return res.status(404).json({ error: 'Staff member not found' });
         }
@@ -29,27 +29,25 @@ module.exports.assignStaffToPatient = async(req, res) => {
         const result = await pool.query("INSERT INTO staff_patient_assignment (s_id, p_id) VALUES ($1, $2) RETURNING *",
             [s_id, id]
         );
-        res.status(201).json(result.rows[0]);
+        return res.status(201).json(result.rows[0]);
     }
     catch(err){
-        console.log(err);
-        res.status(500).json({ error: 'Failed to assign staff to patient' });
+       return next(err);
     }
 }
 
-module.exports.unassignStaffFromPatient = async(req, res) => {
+module.exports.unassignStaffFromPatient = async(req, res, next) => {
     try{
-        let {assignmentId} = req.params;
-        const result = await pool.query("UPDATE staff_patient_assignment SET unassigned_at = NOW() WHERE id = $1 AND unassigned_at IS NULL RETURNING * ",
-            [assignmentId]
+        const {id, assignmentId} = req.params;
+        const result = await pool.query("UPDATE staff_patient_assignment SET unassigned_at = NOW() WHERE id = $1 AND p_id = $2 AND unassigned_at IS NULL RETURNING * ",
+            [assignmentId, id]
         );
         if(result.rows.length === 0) {
             return res.status(404).json({ error: "Active assignment not found" });
         }
-        res.status(200).json(result.rows[0]);
+        return res.status(200).json(result.rows[0]);
     }
     catch(err){
-        console.log(err);
-        res.status(500).json({error : "Failed to unassign staff from patient"});
+        return next(err);
     }
 }

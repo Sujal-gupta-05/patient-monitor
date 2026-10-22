@@ -2,7 +2,7 @@ const bcrypt = require('bcrypt');
 const pool = require('../config/db');
 const passport = require('../config/passport');
 
-module.exports.registerStaff = async (req, res) => {
+module.exports.registerStaff = async (req, res, next) => {
     try {
         const { name, email, password, role, ward } = req.body;
         
@@ -13,20 +13,19 @@ module.exports.registerStaff = async (req, res) => {
             [name, email, hashedPassword, role, ward]
         );
         
-        console.log(result);
-        res.status(201).json(result.rows[0]);
+       
+        return res.status(201).json(result.rows[0]);
         
         
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Failed to register staff' });
+        return next(err);
     }
 }
 
 module.exports.loginStaff = (req, res, next) => {
     passport.authenticate("local", (err, staff, info) => {
         if(err) {
-            return res.status(500).json({ error: 'Something went wrong' });
+           return next(err);
         }
 
         if (!staff) {
@@ -35,18 +34,18 @@ module.exports.loginStaff = (req, res, next) => {
 
         req.logIn(staff, (err) => {
             if (err) {
-                return res.status(500).json({ error: 'Login failed' });
+                return next(err);
             }
             return res.status(200).json({ message: 'Logged in', staff: { s_id: staff.s_id, name: staff.name, role: staff.role } });
         });
     })(req, res, next);
 }
 
-module.exports.logoutStaff = (req,res) => {
+module.exports.logoutStaff = (req, res, next) => {
     req.logout((err) => {
         if(err){
-            return res.status(500).json({error : "Logout failed"});
+            return next(err);
         }
-        res.status(200).json({message: "Logged out successful"});
+        return res.status(200).json({message: "Logged out successfully"});
     });
 }
