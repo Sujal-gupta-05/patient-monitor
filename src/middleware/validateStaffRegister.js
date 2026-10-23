@@ -8,7 +8,7 @@ const staffRegisterSchema = Joi.object({
     password: Joi.string().trim().min(8).required(),
 
     role: Joi.string()
-    .valid('admin', 'nurse', 'doctor')
+    .valid('nurse', 'doctor')
     .required(),
 
     ward: Joi.string().trim().min(1).required()
