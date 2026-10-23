@@ -5,7 +5,9 @@ const { getRiskRules, updateRiskRule } = require("../controllers/RiskRuleControl
 const requireAuth = require("../middleware/requireAuth.js");
 const requireRole = require("../middleware/requireRole.js");
 
+const validateRiskRule = require("../middleware/validateRiskRule.js");
+
 router.get("/", requireAuth, requireRole("admin"), getRiskRules);
 
-router.put("/:vitalType", requireAuth, requireRole("admin"), updateRiskRule);
+router.put("/:vitalType", requireAuth, requireRole("admin"), validateRiskRule, updateRiskRule);
 module.exports = router;
