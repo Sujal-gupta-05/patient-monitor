@@ -8,6 +8,7 @@ let connection = null;
 let channel = null;
 let connecting = false;
 let closing = false;
+const readyHandlers = [];
 
 // Broker unreachable / channel died: nothing is wrong with the event.
 class BrokerUnavailableError extends Error {}
@@ -50,6 +51,8 @@ async function openOnce() {
 
         connection = conn;
         channel = ch;
+
+        for (const fn of readyHandlers) await fn(ch);
     } catch (err) {
         conn.close().catch(() => {});
         throw err;
@@ -75,6 +78,10 @@ async function connectWithRetry() {
     }
 
     connecting = false;
+}
+
+function onReady(fn) {
+    readyHandlers.push(fn);
 }
 
 function connectRabbitMQ() {
@@ -133,6 +140,7 @@ async function closeRabbitMQ() {
 
 module.exports = {
     connectRabbitMQ,
+    onReady,    
     isBrokerReady,
     publishToQueue,
     stopReconnecting,

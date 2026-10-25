@@ -13,3 +13,6 @@ test_login_cookies.txt
 
 # Temporary database schema exports
 schema_updated.sql
+admin.txt
+nurse.txt
+cookies*.txt
