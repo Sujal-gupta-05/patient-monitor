@@ -361,3 +361,87 @@ such as alert creation, severity escalation, and resolution.
 
 This decision improves recoverability of notification dispatch but
 does not guarantee exactly-once delivery.
+
+## 23. Relay failure semantics: broker unavailable vs broker rejected
+
+I first considered counting every failed publish as an attempt (the original
+relay). In testing, a ~50 s broker outage moved events to `failed` after 5
+attempts and the worker never reconnected, which defeats the outbox.
+I also considered retrying forever without counting.
+
+**Decision:** classify failures. `BrokerUnavailableError` (no channel, channel
+closed, confirm timeout) rolls back, leaves the row `pending`, and does not
+touch `retry_count`. `BrokerRejectedError` (an explicit nack) counts as an
+attempt, with backoff, and the event becomes `failed` after 5.
+
+**Verified:** with the broker stopped for ~60 s, new events stayed `pending`
+with `retry_count = 0` and were published after the relay reconnected.
+
+**Trade-off:** a confirm timeout is ambiguous (the broker may have received
+the message), so it is treated as unavailable and can cause a duplicate; the
+consumer must be idempotent (entry 25). `failed` rows have no alerting or
+requeue tooling yet.
+
+## 24. Relay publishes inside its claim transaction, with a confirm timeout
+
+I considered claim-then-publish (mark the row in-flight, commit, publish,
+mark published). I rejected it because a relay that crashes mid-publish leaves
+rows stuck in-flight and needs a lease/sweeper.
+
+**Decision:** claim with `FOR UPDATE SKIP LOCKED`, publish inside the same
+transaction with a 5 s confirm timeout, then mark published. `SKIP LOCKED`
+lets several relays run safely.
+
+**Trade-off:** each in-flight event holds a pooled connection and a row lock
+for up to 5 s if the broker is slow. This corrects entry 22: publishing is
+outside the alert-creation transaction, but inside the relay's claim
+transaction.
+
+## 25. Dispatch consumer: ack after commit, idempotency by unique key
+
+I considered auto-ack (rejected: a crash loses the message) and a separate
+`processed_events` table keyed by `event_id` (more general, one more write and
+table).
+
+**Decision:** manual ack only after the database commit. Idempotency comes from
+`UNIQUE (alert_id, s_id)` with `INSERT ... ON CONFLICT DO NOTHING`; prefetch 5.
+
+**Verified:** a duplicate delivery logged "0 new, 1 already recorded" and the
+row count did not change.
+
+**Trade-off:** this works because the effect is an insert. A future
+non-idempotent effect (SMS, email) needs its own dedup key.
+
+## 26. Retries: TTL retry queue and a dead-letter queue
+
+I considered nack-and-requeue (redelivers immediately, a hot loop), an
+in-process timer (lost on crash), and the delayed-message plugin (extra
+dependency).
+
+**Decision:** `patient.alerts.retry` has a 10 s message TTL and dead-letters
+back into `patient.alerts`. An `x-retry-count` header counts trips; after 3
+retries a message goes to `patient.alerts.dlq`. Messages that can never
+succeed (bad JSON, unknown alert) go straight to the DLQ. The existing
+`patient.alerts` queue arguments are unchanged.
+
+**Verified:** with `alert_dispatch` renamed, a message failed 3 times at 10 s
+intervals and succeeded after the table was restored.
+
+**Trade-off:** the delay is fixed, not exponential, so the system rides out
+only ~30 s of database trouble. The DLQ needs a replay procedure (re-insert
+the outbox event; the consumer is idempotent) and monitoring, neither built.
+Publishing to the retry queue then acking is not atomic; a crash in between
+duplicates harmlessly.
+
+## 27. Recipients are recorded at dispatch time in `alert_dispatch`
+
+I considered computing recipients at read time from current assignments.
+
+**Decision:** store one row per (alert, staff member) when the alert is
+dispatched, so the record shows who was responsible then, even if assignments
+change later. It also gives the dashboard something to catch up from and
+`delivered_at` something to track.
+
+**Open limitation:** a patient with no active assignee produces no rows and
+only a log warning. I also made the consumer skip retracted alerts; that was
+my assumption, not a decision I have reviewed.

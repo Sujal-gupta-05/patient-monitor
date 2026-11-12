@@ -9,6 +9,8 @@ const AlertRouter = require("./src/routes/AlertRouter.js");
 const RiskRuleRouter = require("./src/routes/RiskRuleRouter");
 
 const errorHandler = require("./src/middleware/errorHandler");
+const http = require('http');
+const { WebSocketServer } = require("ws");
 
 const { createClient } = require("redis");
 const { RedisStore } = require("connect-redis");
@@ -30,7 +32,7 @@ app.use(cors({
 
 app.use(express.json());
 
-app.use(session({
+const sessionMiddleware = session({
   store: new RedisStore({
     client: redisClient,
     prefix: "patient-monitor:sess:"
@@ -41,7 +43,9 @@ app.use(session({
   cookie: {
     maxAge: 1000 * 60 * 60 * 24
   }
-}));
+});
+
+app.use(sessionMiddleware);
 
 
 app.use(passport.initialize());
@@ -57,12 +61,37 @@ app.use(errorHandler);
 
 const PORT = process.env.PORT || 8080;
 
+const server = http.createServer(app);
+
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  if (req.url !== '/ws') {
+    socket.destroy();
+    return;
+  }
+
+  sessionMiddleware(req, {}, () => {
+    const sId = req.session && req.session.passport && req.session.passport.user;
+
+    if (!sId) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.send(JSON.stringify({ type: 'hello', s_id: sId }));
+    });
+  });
+});
+
 
 async function startServer(){
   try{
     await redisClient.connect();
 
-    app.listen(PORT, () => {
+    server.listen(PORT, () => {
       console.log(`app is listening on port ${PORT}`);
     });
   }

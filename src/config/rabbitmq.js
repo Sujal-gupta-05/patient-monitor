@@ -10,10 +10,10 @@ let connecting = false;
 let closing = false;
 const readyHandlers = [];
 
-// Broker unreachable / channel died: nothing is wrong with the event.
+
 class BrokerUnavailableError extends Error {}
-// Broker explicitly refused the message (nack): the event itself was rejected.
 class BrokerRejectedError extends Error {}
+class BrokerOutcomeUnknownError extends Error {}
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
